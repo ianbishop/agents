@@ -31,6 +31,8 @@ from .tool_context import (
     get_function_info,
     is_function_tool,
     is_raw_function_tool,
+    get_raw_function_info,
+    _FunctionToolInfo,
 )
 
 if TYPE_CHECKING:
@@ -177,8 +179,16 @@ def build_legacy_openai_schema(
     """non-strict mode tool description
     see https://serde.rs/enum-representations.html for the internally tagged representation"""
     model = function_arguments_to_pydantic_model(function_tool)
-    info = get_function_info(function_tool)
-    schema = model.model_json_schema()
+    if is_raw_function_tool(function_tool):
+        raw_info = get_raw_function_info(function_tool)
+        info = _FunctionToolInfo(
+            name=raw_info.name,
+            description=raw_info.raw_schema["description"],
+        )
+        schema = raw_info.raw_schema["parameters"]
+    else:
+        info = get_function_info(function_tool)
+        schema = model.model_json_schema()
 
     if internally_tagged:
         return {
