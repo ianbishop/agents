@@ -6,7 +6,7 @@ from collections.abc import Generator, Sequence
 from typing import Any, Callable
 
 from .. import llm, utils
-
+from ..log import logger
 
 class SpeechHandle:
     SPEECH_PRIORITY_LOW = 0

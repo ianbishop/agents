@@ -962,7 +962,16 @@ class AgentActivity(RecognitionHooks):
                         self.min_consecutive_speech_delay - (time.time() - last_playout_ts)
                     )
                 speech._authorize_generation()
-                await speech._wait_for_generation()
+                gen_task = asyncio.create_task(speech._wait_for_generation())
+
+                _, pending = await asyncio.wait(
+                    [gen_task, speech._interrupt_fut],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in pending:
+                    task.cancel()
+
                 self._current_speech = None
                 last_playout_ts = time.time()
 
