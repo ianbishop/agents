@@ -6,7 +6,6 @@ from collections.abc import Generator, Sequence
 from typing import Any, Callable
 
 from .. import llm, utils
-from ..log import logger
 
 class SpeechHandle:
     SPEECH_PRIORITY_LOW = 0
@@ -110,6 +109,9 @@ class SpeechHandle:
             raise RuntimeError("This generation handle does not allow interruptions")
 
         self._cancel()
+
+        self._mark_done()
+
         return self
 
     async def wait_for_playout(self) -> None:
