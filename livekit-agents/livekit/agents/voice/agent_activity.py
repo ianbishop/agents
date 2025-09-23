@@ -930,6 +930,7 @@ class AgentActivity(RecognitionHooks):
                 # with perf_counter_ns(), collisions should be rare
                 pass
 
+        speech._clear_scheduled()
         speech._mark_scheduled()
         self._wake_up_scheduling_task()
 

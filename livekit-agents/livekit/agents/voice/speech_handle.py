@@ -22,7 +22,7 @@ class SpeechHandle:
 
         self._interrupt_fut = asyncio.Future[None]()
         self._done_fut = asyncio.Future[None]()
-        self._scheduled_fut = asyncio.Future[None]()
+        self._scheduled_event = asyncio.Event()
         self._authorize_event = asyncio.Event()
 
         self._generations: list[asyncio.Future[None]] = []
@@ -59,7 +59,7 @@ class SpeechHandle:
 
     @property
     def scheduled(self) -> bool:
-        return self._scheduled_fut.done()
+        return self._scheduled_event.is_set()
 
     @property
     def interrupted(self) -> bool:
@@ -195,7 +195,7 @@ class SpeechHandle:
         await asyncio.shield(self._generations[step_idx])
 
     async def _wait_for_scheduled(self) -> None:
-        await asyncio.shield(self._scheduled_fut)
+        await asyncio.shield(self._scheduled_event.wait())
 
     def _mark_generation_done(self) -> None:
         if not self._generations:
@@ -213,4 +213,7 @@ class SpeechHandle:
 
     def _mark_scheduled(self) -> None:
         with contextlib.suppress(asyncio.InvalidStateError):
-            self._scheduled_fut.set_result(None)
+            self._scheduled_event.set()
+
+    def _clear_scheduled(self) -> None:
+        self._scheduled_event.clear()
