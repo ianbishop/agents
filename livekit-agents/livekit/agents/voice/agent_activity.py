@@ -1560,315 +1560,318 @@ class AgentActivity(RecognitionHooks):
         instructions: str | None = None,
         _tools_messages: Sequence[llm.FunctionCall | llm.FunctionCallOutput] | None = None,
     ) -> None:
-        from .agent import ModelSettings
+        try:
+            from .agent import ModelSettings
 
-        current_span = trace.get_current_span()
-        current_span.set_attribute(trace_types.ATTR_SPEECH_ID, speech_handle.id)
-        if instructions is not None:
-            current_span.set_attribute(trace_types.ATTR_INSTRUCTIONS, instructions)
-        if new_message:
-            current_span.set_attribute(trace_types.ATTR_USER_INPUT, new_message.text_content or "")
+            current_span = trace.get_current_span()
+            current_span.set_attribute(trace_types.ATTR_SPEECH_ID, speech_handle.id)
+            if instructions is not None:
+                current_span.set_attribute(trace_types.ATTR_INSTRUCTIONS, instructions)
+            if new_message:
+                current_span.set_attribute(trace_types.ATTR_USER_INPUT, new_message.text_content or "")
 
-        audio_output = self._session.output.audio if self._session.output.audio_enabled else None
-        text_output = (
-            self._session.output.transcription
-            if self._session.output.transcription_enabled
-            else None
-        )
-        chat_ctx = chat_ctx.copy()
-        tool_ctx = llm.ToolContext(tools)
+            audio_output = self._session.output.audio if self._session.output.audio_enabled else None
+            text_output = (
+                self._session.output.transcription
+                if self._session.output.transcription_enabled
+                else None
+            )
+            chat_ctx = chat_ctx.copy()
+            tool_ctx = llm.ToolContext(tools)
 
-        if new_message is not None:
-            chat_ctx.insert(new_message)
+            if new_message is not None:
+                chat_ctx.insert(new_message)
 
-        if instructions is not None:
-            try:
-                update_instructions(chat_ctx, instructions=instructions, add_if_missing=True)
-            except ValueError:
-                logger.exception("failed to update the instructions")
+            if instructions is not None:
+                try:
+                    update_instructions(chat_ctx, instructions=instructions, add_if_missing=True)
+                except ValueError:
+                    logger.exception("failed to update the instructions")
 
-        # TODO(theomonnom): since pause is closing STT/LLM/TTS, we have issues for SpeechHandle still in queue  # noqa: E501
-        # I should implement a retry mechanism?
+            # TODO(theomonnom): since pause is closing STT/LLM/TTS, we have issues for SpeechHandle still in queue  # noqa: E501
+            # I should implement a retry mechanism?
 
-        tasks: list[asyncio.Task[Any]] = []
-        llm_task, llm_gen_data = perform_llm_inference(
-            node=self._agent.llm_node,
-            chat_ctx=chat_ctx,
-            tool_ctx=tool_ctx,
-            model_settings=model_settings,
-        )
-        tasks.append(llm_task)
-
-        text_tee = utils.aio.itertools.tee(llm_gen_data.text_ch, 2)
-        tts_text_input, tr_input = text_tee
-
-        tts_task: asyncio.Task[bool] | None = None
-        tts_gen_data: _TTSGenerationData | None = None
-        read_transcript_from_tts = False
-        if audio_output is not None:
-            await llm_gen_data.started_fut  # make sure tts span starts after llm span
-            tts_task, tts_gen_data = perform_tts_inference(
-                node=self._agent.tts_node,
-                input=tts_text_input,
+            tasks: list[asyncio.Task[Any]] = []
+            llm_task, llm_gen_data = perform_llm_inference(
+                node=self._agent.llm_node,
+                chat_ctx=chat_ctx,
+                tool_ctx=tool_ctx,
                 model_settings=model_settings,
             )
-            tasks.append(tts_task)
-            if (
-                self.use_tts_aligned_transcript
-                and (tts := self.tts)
-                and (tts.capabilities.aligned_transcript or not tts.capabilities.streaming)
-                and (timed_texts := await tts_gen_data.timed_texts_fut)
-            ):
-                tr_input = timed_texts
-                read_transcript_from_tts = True
+            tasks.append(llm_task)
 
-        wait_for_scheduled = asyncio.ensure_future(speech_handle._wait_for_scheduled())
-        await speech_handle.wait_if_not_interrupted([wait_for_scheduled])
+            text_tee = utils.aio.itertools.tee(llm_gen_data.text_ch, 2)
+            tts_text_input, tr_input = text_tee
 
-        # add new message to chat context if the speech is scheduled
-        if new_message is not None and speech_handle.scheduled:
-            self._agent._chat_ctx.insert(new_message)
-            self._session._conversation_item_added(new_message)
-
-        if speech_handle.interrupted:
-            current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
-            await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
-            await text_tee.aclose()
-            return
-
-        self._session._update_agent_state("thinking")
-
-        wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
-        await speech_handle.wait_if_not_interrupted([wait_for_authorization])
-        speech_handle._clear_authorization()
-
-        if speech_handle.interrupted:
-            current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
-            await utils.aio.cancel_and_wait(*tasks, wait_for_authorization)
-            await text_tee.aclose()
-            return
-
-        reply_started_at = time.time()
-
-        tr_node = self._agent.transcription_node(tr_input, model_settings)
-        tr_node_result = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
-        text_out: _TextOutput | None = None
-        text_forward_task: asyncio.Task | None = None
-        if tr_node_result is not None:
-            text_forward_task, text_out = perform_text_forwarding(
-                text_output=text_output, source=tr_node_result
-            )
-            tasks.append(text_forward_task)
-
-        def _on_first_frame(_: asyncio.Future[None]) -> None:
-            self._session._update_agent_state("speaking")
-
-        audio_out: _AudioOutput | None = None
-        if audio_output is not None:
-            assert tts_gen_data is not None
-            # TODO(theomonnom): should the audio be added to the chat_context too?
-            forward_task, audio_out = perform_audio_forwarding(
-                audio_output=audio_output, tts_output=tts_gen_data.audio_ch
-            )
-            tasks.append(forward_task)
-
-            audio_out.first_frame_fut.add_done_callback(_on_first_frame)
-        elif text_out is not None:
-            text_out.first_text_fut.add_done_callback(_on_first_frame)
-
-        # before executing tools, make sure we generated all the text
-        # (this ensure everything is kept ordered)
-        if text_forward_task:
-            await speech_handle.wait_if_not_interrupted([text_forward_task])
-
-        generated_msg: llm.ChatMessage | None = None
-        if text_out and text_out.text:
-            # emit the assistant message to the SpeechHandle before calling the tools
-            generated_msg = llm.ChatMessage(
-                role="assistant",
-                content=[text_out.text],
-                id=llm_gen_data.id,
-                interrupted=False,
-                created_at=reply_started_at,
-            )
-            speech_handle._item_added([generated_msg])
-
-        def _tool_execution_started_cb(fnc_call: llm.FunctionCall) -> None:
-            speech_handle._item_added([fnc_call])
-
-        def _tool_execution_completed_cb(out: ToolExecutionOutput) -> None:
-            if out.fnc_call_out:
-                speech_handle._item_added([out.fnc_call_out])
-
-        # start to execute tools (only after play())
-        exe_task, tool_output = perform_tool_executions(
-            session=self._session,
-            speech_handle=speech_handle,
-            tool_ctx=tool_ctx,
-            tool_choice=model_settings.tool_choice,
-            function_stream=llm_gen_data.function_ch,
-            tool_execution_started_cb=_tool_execution_started_cb,
-            tool_execution_completed_cb=_tool_execution_completed_cb,
-        )
-
-        await speech_handle.wait_if_not_interrupted([*tasks])
-
-        # wait for the end of the playout if the audio is enabled
-        if audio_output is not None:
-            await speech_handle.wait_if_not_interrupted(
-                [asyncio.ensure_future(audio_output.wait_for_playout())]
-            )
-
-        current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
-
-        # add the tools messages that triggers this reply to the chat context
-        if _tools_messages:
-            for msg in _tools_messages:
-                # reset the created_at to the reply start time
-                msg.created_at = reply_started_at
-            self._agent._chat_ctx.insert(_tools_messages)
-            self._session._tool_items_added(_tools_messages)
-
-        if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(*tasks)
-            await text_tee.aclose()
-
-            forwarded_text = text_out.text if text_out else ""
-            # if the audio playout was enabled, clear the buffer
+            tts_task: asyncio.Task[bool] | None = None
+            tts_gen_data: _TTSGenerationData | None = None
+            read_transcript_from_tts = False
             if audio_output is not None:
-                audio_output.clear_buffer()
-
-                playback_ev = await audio_output.wait_for_playout()
-                if audio_out is not None and audio_out.first_frame_fut.done():
-                    # playback_ev is valid only if the first frame was already played
-                    if playback_ev.synchronized_transcript is not None:
-                        forwarded_text = playback_ev.synchronized_transcript
-                else:
-                    forwarded_text = ""
-
-            copy_msg: llm.ChatMessage | None = None
-            if generated_msg:
-                copy_msg = generated_msg.model_copy()
-                copy_msg.content = [forwarded_text]
-                copy_msg.interrupted = True
-
-                if forwarded_text:
-                    self._agent._chat_ctx.insert(copy_msg)
-                    self._session._conversation_item_added(copy_msg)
-
-                current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
-
-            if self._session.agent_state == "speaking":
-                self._session._update_agent_state("listening")
-
-            speech_handle._mark_generation_done()
-            await utils.aio.cancel_and_wait(exe_task)
-            return
-
-        if read_transcript_from_tts and text_out and not text_out.text:
-            logger.warning(
-                "`use_tts_aligned_transcript` is enabled but no agent transcript was returned from tts"
-            )
-
-        if generated_msg:
-            self._agent._chat_ctx.insert(generated_msg)
-            self._session._conversation_item_added(generated_msg)
-            current_span.set_attribute(
-                trace_types.ATTR_RESPONSE_TEXT, generated_msg.text_content or ""
-            )
-
-        if len(tool_output.output) > 0:
-            self._session._update_agent_state("thinking")
-        elif self._session.agent_state == "speaking":
-            self._session._update_agent_state("listening")
-
-        await text_tee.aclose()
-
-        speech_handle._mark_generation_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
-        self._background_speeches.add(speech_handle)
-        try:
-            await exe_task
-        finally:
-            self._background_speeches.discard(speech_handle)
-
-        # important: no agent output should be used after this point
-
-        if len(tool_output.output) > 0:
-            if speech_handle.num_steps >= self._session.options.max_tool_steps + 1:
-                logger.warning(
-                    "maximum number of function calls steps reached",
-                    extra={"speech_id": speech_handle.id},
+                await llm_gen_data.started_fut  # make sure tts span starts after llm span
+                tts_task, tts_gen_data = perform_tts_inference(
+                    node=self._agent.tts_node,
+                    input=tts_text_input,
+                    model_settings=model_settings,
                 )
+                tasks.append(tts_task)
+                if (
+                    self.use_tts_aligned_transcript
+                    and (tts := self.tts)
+                    and (tts.capabilities.aligned_transcript or not tts.capabilities.streaming)
+                    and (timed_texts := await tts_gen_data.timed_texts_fut)
+                ):
+                    tr_input = timed_texts
+                    read_transcript_from_tts = True
+
+            wait_for_scheduled = asyncio.ensure_future(speech_handle._wait_for_scheduled())
+            await speech_handle.wait_if_not_interrupted([wait_for_scheduled])
+
+            # add new message to chat context if the speech is scheduled
+            if new_message is not None and speech_handle.scheduled:
+                self._agent._chat_ctx.insert(new_message)
+                self._session._conversation_item_added(new_message)
+
+            if speech_handle.interrupted:
+                current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+                await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
+                await text_tee.aclose()
                 return
 
-            speech_handle._num_steps += 1
+            self._session._update_agent_state("thinking")
 
-            new_calls: list[llm.FunctionCall] = []
-            new_fnc_outputs: list[llm.FunctionCallOutput] = []
-            new_agent_task: Agent | None = None
-            ignore_task_switch = False
-            fnc_executed_ev = FunctionToolsExecutedEvent(
-                function_calls=[], function_call_outputs=[]
+            wait_for_authorization = asyncio.ensure_future(speech_handle._wait_for_authorization())
+            await speech_handle.wait_if_not_interrupted([wait_for_authorization])
+            speech_handle._clear_authorization()
+
+            if speech_handle.interrupted:
+                current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
+                await utils.aio.cancel_and_wait(*tasks, wait_for_authorization)
+                await text_tee.aclose()
+                return
+
+            reply_started_at = time.time()
+
+            tr_node = self._agent.transcription_node(tr_input, model_settings)
+            tr_node_result = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
+            text_out: _TextOutput | None = None
+            text_forward_task: asyncio.Task | None = None
+            if tr_node_result is not None:
+                text_forward_task, text_out = perform_text_forwarding(
+                    text_output=text_output, source=tr_node_result
+                )
+                tasks.append(text_forward_task)
+
+            def _on_first_frame(_: asyncio.Future[None]) -> None:
+                self._session._update_agent_state("speaking")
+
+            audio_out: _AudioOutput | None = None
+            if audio_output is not None:
+                assert tts_gen_data is not None
+                # TODO(theomonnom): should the audio be added to the chat_context too?
+                forward_task, audio_out = perform_audio_forwarding(
+                    audio_output=audio_output, tts_output=tts_gen_data.audio_ch
+                )
+                tasks.append(forward_task)
+
+                audio_out.first_frame_fut.add_done_callback(_on_first_frame)
+            elif text_out is not None:
+                text_out.first_text_fut.add_done_callback(_on_first_frame)
+
+            # before executing tools, make sure we generated all the text
+            # (this ensure everything is kept ordered)
+            if text_forward_task:
+                await speech_handle.wait_if_not_interrupted([text_forward_task])
+
+            generated_msg: llm.ChatMessage | None = None
+            if text_out and text_out.text:
+                # emit the assistant message to the SpeechHandle before calling the tools
+                generated_msg = llm.ChatMessage(
+                    role="assistant",
+                    content=[text_out.text],
+                    id=llm_gen_data.id,
+                    interrupted=False,
+                    created_at=reply_started_at,
+                )
+                speech_handle._item_added([generated_msg])
+
+            def _tool_execution_started_cb(fnc_call: llm.FunctionCall) -> None:
+                speech_handle._item_added([fnc_call])
+
+            def _tool_execution_completed_cb(out: ToolExecutionOutput) -> None:
+                if out.fnc_call_out:
+                    speech_handle._item_added([out.fnc_call_out])
+
+            # start to execute tools (only after play())
+            exe_task, tool_output = perform_tool_executions(
+                session=self._session,
+                speech_handle=speech_handle,
+                tool_ctx=tool_ctx,
+                tool_choice=model_settings.tool_choice,
+                function_stream=llm_gen_data.function_ch,
+                tool_execution_started_cb=_tool_execution_started_cb,
+                tool_execution_completed_cb=_tool_execution_completed_cb,
             )
-            for sanitized_out in tool_output.output:
-                if sanitized_out.fnc_call_out is not None:
-                    new_calls.append(sanitized_out.fnc_call)
-                    new_fnc_outputs.append(sanitized_out.fnc_call_out)
-                    if sanitized_out.reply_required:
-                        fnc_executed_ev._reply_required = True
 
-                # add the function call and output to the event, including the None outputs
-                fnc_executed_ev.function_calls.append(sanitized_out.fnc_call)
-                fnc_executed_ev.function_call_outputs.append(sanitized_out.fnc_call_out)
+            await speech_handle.wait_if_not_interrupted([*tasks])
 
-                if new_agent_task is not None and sanitized_out.agent_task is not None:
-                    logger.error("expected to receive only one AgentTask from the tool executions")
-                    ignore_task_switch = True
-                    # TODO(long): should we mark the function call as failed to notify the LLM?
-
-                new_agent_task = sanitized_out.agent_task
-
-            if new_agent_task and not ignore_task_switch:
-                fnc_executed_ev._handoff_required = True
-
-            self._session.emit("function_tools_executed", fnc_executed_ev)
-
-            draining = self.scheduling_paused
-            if fnc_executed_ev._handoff_required and new_agent_task and not ignore_task_switch:
-                self._session.update_agent(new_agent_task)
-                draining = True
-
-            tool_messages = new_calls + new_fnc_outputs
-            if fnc_executed_ev._reply_required:
-                chat_ctx.items.extend(tool_messages)
-
-                tool_response_task = self._create_speech_task(
-                    self._pipeline_reply_task(
-                        speech_handle=speech_handle,
-                        chat_ctx=chat_ctx,
-                        tools=tools,
-                        model_settings=ModelSettings(
-                            # Avoid setting tool_choice to "required" or a specific function when
-                            # passing tool response back to the LLM
-                            tool_choice="none"
-                            if draining or model_settings.tool_choice == "none"
-                            else "auto",
-                        ),
-                        _tools_messages=tool_messages,
-                    ),
-                    speech_handle=speech_handle,
-                    name="AgentActivity.pipeline_reply",
+            # wait for the end of the playout if the audio is enabled
+            if audio_output is not None:
+                await speech_handle.wait_if_not_interrupted(
+                    [asyncio.ensure_future(audio_output.wait_for_playout())]
                 )
-                tool_response_task.add_done_callback(self._on_pipeline_reply_done)
-                self._schedule_speech(
-                    speech_handle, SpeechHandle.SPEECH_PRIORITY_NORMAL, force=True
-                )
-            elif len(new_fnc_outputs) > 0:
-                # add the tool calls and outputs to the chat context even no reply is generated
-                for msg in tool_messages:
+
+            current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
+
+            # add the tools messages that triggers this reply to the chat context
+            if _tools_messages:
+                for msg in _tools_messages:
+                    # reset the created_at to the reply start time
                     msg.created_at = reply_started_at
-                self._agent._chat_ctx.insert(tool_messages)
-                self._session._tool_items_added(tool_messages)
+                self._agent._chat_ctx.insert(_tools_messages)
+                self._session._tool_items_added(_tools_messages)
+
+            if speech_handle.interrupted:
+                await utils.aio.cancel_and_wait(*tasks)
+                await text_tee.aclose()
+
+                forwarded_text = text_out.text if text_out else ""
+                # if the audio playout was enabled, clear the buffer
+                if audio_output is not None:
+                    audio_output.clear_buffer()
+
+                    playback_ev = await audio_output.wait_for_playout()
+                    if audio_out is not None and audio_out.first_frame_fut.done():
+                        # playback_ev is valid only if the first frame was already played
+                        if playback_ev.synchronized_transcript is not None:
+                            forwarded_text = playback_ev.synchronized_transcript
+                    else:
+                        forwarded_text = ""
+
+                copy_msg: llm.ChatMessage | None = None
+                if generated_msg:
+                    copy_msg = generated_msg.model_copy()
+                    copy_msg.content = [forwarded_text]
+                    copy_msg.interrupted = True
+
+                    if forwarded_text:
+                        self._agent._chat_ctx.insert(copy_msg)
+                        self._session._conversation_item_added(copy_msg)
+
+                    current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
+
+                if self._session.agent_state == "speaking":
+                    self._session._update_agent_state("listening")
+
+                speech_handle._mark_generation_done()
+                await utils.aio.cancel_and_wait(exe_task)
+                return
+
+            if read_transcript_from_tts and text_out and not text_out.text:
+                logger.warning(
+                    "`use_tts_aligned_transcript` is enabled but no agent transcript was returned from tts"
+                )
+
+            if generated_msg:
+                self._agent._chat_ctx.insert(generated_msg)
+                self._session._conversation_item_added(generated_msg)
+                current_span.set_attribute(
+                    trace_types.ATTR_RESPONSE_TEXT, generated_msg.text_content or ""
+                )
+
+            if len(tool_output.output) > 0:
+                self._session._update_agent_state("thinking")
+            elif self._session.agent_state == "speaking":
+                self._session._update_agent_state("listening")
+
+            await text_tee.aclose()
+
+            speech_handle._mark_generation_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
+            self._background_speeches.add(speech_handle)
+            try:
+                await exe_task
+            finally:
+                self._background_speeches.discard(speech_handle)
+
+            # important: no agent output should be used after this point
+
+            if len(tool_output.output) > 0:
+                if speech_handle.num_steps >= self._session.options.max_tool_steps + 1:
+                    logger.warning(
+                        "maximum number of function calls steps reached",
+                        extra={"speech_id": speech_handle.id},
+                    )
+                    return
+
+                speech_handle._num_steps += 1
+
+                new_calls: list[llm.FunctionCall] = []
+                new_fnc_outputs: list[llm.FunctionCallOutput] = []
+                new_agent_task: Agent | None = None
+                ignore_task_switch = False
+                fnc_executed_ev = FunctionToolsExecutedEvent(
+                    function_calls=[], function_call_outputs=[]
+                )
+                for sanitized_out in tool_output.output:
+                    if sanitized_out.fnc_call_out is not None:
+                        new_calls.append(sanitized_out.fnc_call)
+                        new_fnc_outputs.append(sanitized_out.fnc_call_out)
+                        if sanitized_out.reply_required:
+                            fnc_executed_ev._reply_required = True
+
+                    # add the function call and output to the event, including the None outputs
+                    fnc_executed_ev.function_calls.append(sanitized_out.fnc_call)
+                    fnc_executed_ev.function_call_outputs.append(sanitized_out.fnc_call_out)
+
+                    if new_agent_task is not None and sanitized_out.agent_task is not None:
+                        logger.error("expected to receive only one AgentTask from the tool executions")
+                        ignore_task_switch = True
+                        # TODO(long): should we mark the function call as failed to notify the LLM?
+
+                    new_agent_task = sanitized_out.agent_task
+
+                if new_agent_task and not ignore_task_switch:
+                    fnc_executed_ev._handoff_required = True
+
+                self._session.emit("function_tools_executed", fnc_executed_ev)
+
+                draining = self.scheduling_paused
+                if fnc_executed_ev._handoff_required and new_agent_task and not ignore_task_switch:
+                    self._session.update_agent(new_agent_task)
+                    draining = True
+
+                tool_messages = new_calls + new_fnc_outputs
+                if fnc_executed_ev._reply_required:
+                    chat_ctx.items.extend(tool_messages)
+
+                    tool_response_task = self._create_speech_task(
+                        self._pipeline_reply_task(
+                            speech_handle=speech_handle,
+                            chat_ctx=chat_ctx,
+                            tools=tools,
+                            model_settings=ModelSettings(
+                                # Avoid setting tool_choice to "required" or a specific function when
+                                # passing tool response back to the LLM
+                                tool_choice="none"
+                                if draining or model_settings.tool_choice == "none"
+                                else "auto",
+                            ),
+                            _tools_messages=tool_messages,
+                        ),
+                        speech_handle=speech_handle,
+                        name="AgentActivity.pipeline_reply",
+                    )
+                    tool_response_task.add_done_callback(self._on_pipeline_reply_done)
+                    self._schedule_speech(
+                        speech_handle, SpeechHandle.SPEECH_PRIORITY_NORMAL, force=True
+                    )
+                elif len(new_fnc_outputs) > 0:
+                    # add the tool calls and outputs to the chat context even no reply is generated
+                    for msg in tool_messages:
+                        msg.created_at = reply_started_at
+                    self._agent._chat_ctx.insert(tool_messages)
+                    self._session._tool_items_added(tool_messages)
+        finally:
+            speech_handle._mark_generation_done()
 
     @utils.log_exceptions(logger=logger)
     async def _realtime_reply_task(
